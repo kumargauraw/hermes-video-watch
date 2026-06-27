@@ -162,6 +162,25 @@ python3 scripts/hermes_video_watch.py ./meeting.mp4 \
   --stt-command 'my-transcriber --json {audio}'
 ```
 
+Long-video deep mode: first suggest transcript-guided visual ranges, then extract focused screenshots for those ranges:
+
+```bash
+python3 scripts/hermes_video_watch.py ./lecture.mp4 \
+  --suggest-ranges \
+  --stt-provider auto \
+  --range-padding 20 \
+  --max-ranges 8 \
+  --out-dir /tmp/hermes-video-watch-deep
+
+python3 scripts/hermes_video_watch.py ./lecture.mp4 \
+  --ranges /tmp/hermes-video-watch-deep/suggested_ranges.json \
+  --max-frames 12 \
+  --resolution 1280 \
+  --out-dir /tmp/hermes-video-watch-deep-focused
+```
+
+`suggested_ranges.json` is built from captions/STT transcript cues such as `diagram`, `screen`, `slide`, `chart`, `look at`, `shown here`, `architecture`, `workflow`, `terminal`, `command`, `code`, `demo`, `settings`, `dashboard`, `UI`, and `example`. Override with `--visual-cues "diagram,demo,terminal"`. Multi-range extraction writes per-range artifacts under `ranges/001.../` and a top-level `multi_range_manifest.json`. Manifests include `visual_coverage_mode` (`single_range_or_scan`, `suggested_ranges`, or `multi_range_focused`) so downstream answers do not overclaim coverage.
+
 STT-related environment variables:
 
 - `HERMES_VIDEO_WATCH_STT_PROVIDER`: `none`, `auto`, `local`, `groq`, `openai`, `mistral`, or `command`.

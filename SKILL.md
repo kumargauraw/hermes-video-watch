@@ -102,6 +102,25 @@ python3 scripts/hermes_video_watch.py \
   --stt-language en
 ```
 
+For long-video deep mode, let the helper find visual-cue transcript clusters, then extract multiple focused ranges instead of doing one sparse 100-frame scan:
+
+```bash
+python3 scripts/hermes_video_watch.py "$VIDEO_URL_OR_FILE" \
+  --suggest-ranges \
+  --stt-provider auto \
+  --range-padding 20 \
+  --max-ranges 8 \
+  --out-dir /tmp/hermes-video-watch-deep
+
+python3 scripts/hermes_video_watch.py "$VIDEO_URL_OR_FILE" \
+  --ranges /tmp/hermes-video-watch-deep/suggested_ranges.json \
+  --max-frames 12 \
+  --resolution 1280 \
+  --out-dir /tmp/hermes-video-watch-deep-focused
+```
+
+Default visual cues include `diagram`, `screen`, `slide`, `chart`, `look at`, `shown here`, `architecture`, `workflow`, `terminal`, `command`, `code`, `demo`, `settings`, `dashboard`, `UI`, and `example`; override with `--visual-cues`. `--ranges` creates `ranges/001.../` subfolders with their own frames/contact sheet/report/manifest plus a top-level `multi_range_manifest.json`. Treat the manifest `visual_coverage_mode` as a claim boundary: `suggested_ranges` is not visual inspection, and `multi_range_focused` covers only the listed ranges.
+
 To prefer a specific Whisper/Voxtral provider over captions:
 
 ```bash
@@ -140,6 +159,8 @@ The helper creates:
 - `contact_sheet.jpg` — tiled overview of extracted frames.
 - `download/` — downloaded video/clip and metadata for URL sources.
 - `transcript.txt` — timestamped transcript from captions/subtitles or configured STT.
+- `suggested_ranges.json` — transcript-guided long-video visual range suggestions when `--suggest-ranges` is used.
+- `multi_range_manifest.json` plus `ranges/001.../` — focused multi-range artifacts when `--ranges` is used.
 
 Inspect the manifest:
 

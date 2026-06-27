@@ -20,6 +20,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
+DEFAULT_VISUAL_CUES = [
+    "diagram", "screen", "slide", "chart", "look at", "shown here",
+    "architecture", "workflow", "terminal", "command", "code", "demo",
+    "settings", "dashboard", "ui", "example",
+]
 
 
 def eprint(*args):
@@ -63,6 +68,12 @@ def fmt_time(seconds: float | int | None) -> str:
     if h:
         return f"{h:02d}:{m:02d}:{s:05.2f}"
     return f"{m:02d}:{s:05.2f}"
+
+
+def time_arg(seconds: float | int | None) -> str | None:
+    if seconds is None:
+        return None
+    return fmt_time(seconds).replace(".00", "")
 
 
 def safe_time_for_name(seconds: float | int | None) -> str:
@@ -329,7 +340,8 @@ def _normalize_stt_segments(data, absolute_offset: float = 0.0) -> list[dict]:
 
 def _curl_json_multipart(url: str, api_key: str, audio: Path, fields: dict[str, str]) -> dict:
     require_binary("curl")
-    cmd = ["curl", "-sS", "-X", "POST", url, "-H", f"Authorization: Bearer {api_key}"]
+    auth_header = "Authorization: Bearer " + api_key
+    cmd = ["curl", "-sS", "-X", "POST", url, "-H", auth_header]
     safe_cmd = ["curl", "-sS", "-X", "POST", url, "-H", "Authorization: Bearer ***"]
     for key, value in fields.items():
         if value is not None and value != "":
@@ -465,6 +477,136 @@ def transcribe_audio(audio: Path, provider: str, args, absolute_offset: float) -
     return segments, provider, model
 
 
+def parse_visual_cues(value: str | None) -> list[str]:
+    if not value:
+        return DEFAULT_VISUAL_CUES[:]
+    cues = [c.strip().lower() for c in re.split(r"[,|]", value) if c.strip()]
+    return cues or DEFAULT_VISUAL_CUES[:]
+
+
+def segment_cues(text: str, cues: list[str]) -> list[str]:
+    text_l = text.lower()
+    found = []
+    for cue in cues:
+        pattern = re.escape(cue.lower())
+        if re.search(rf"(?<!\w){pattern}(?!\w)", text_l):
+            found.append(cue)
+    return found
+
+
+def suggest_ranges_from_transcript(
+    segments: list[dict],
+    cues: list[str],
+    padding: float,
+    max_ranges: int,
+    duration: float | None = None,
+) -> list[dict]:
+    windows: list[dict] = []
+    for seg in segments:
+        matches = segment_cues(str(seg.get("text", "")), cues)
+        if not matches:
+            continue
+        try:
+            seg_start = float(seg.get("start") or 0)
+        except Exception:
+            seg_start = 0.0
+        try:
+            seg_end = float(seg.get("end")) if seg.get("end") is not None else seg_start + 4.0
+        except Exception:
+            seg_end = seg_start + 4.0
+        start = max(0.0, seg_start - padding)
+        end = max(start + 1.0, seg_end + padding)
+        if duration and duration > 0:
+            end = min(duration, end)
+        windows.append({
+            "start": start,
+            "end": end,
+            "score": len(matches),
+            "cues": sorted(set(matches)),
+            "segments": [{
+                "start": seg_start,
+                "end": seg_end,
+                "timestamp": fmt_time(seg_start),
+                "text": seg.get("text", ""),
+                "cues": sorted(set(matches)),
+            }],
+        })
+    if not windows:
+        return []
+    windows.sort(key=lambda r: (r["start"], r["end"]))
+    merged: list[dict] = []
+    for win in windows:
+        if merged and win["start"] <= merged[-1]["end"]:
+            cur = merged[-1]
+            cur["end"] = max(cur["end"], win["end"])
+            cur["score"] += win["score"]
+            cur["cues"] = sorted(set(cur["cues"]) | set(win["cues"]))
+            cur["segments"].extend(win["segments"])
+        else:
+            merged.append(win)
+    top = sorted(merged, key=lambda r: (-r["score"], r["start"]))[:max(1, max_ranges)]
+    top.sort(key=lambda r: r["start"])
+    for idx, item in enumerate(top, 1):
+        item["index"] = idx
+        item["start"] = round(item["start"], 3)
+        item["end"] = round(item["end"], 3)
+        item["start_timestamp"] = fmt_time(item["start"])
+        item["end_timestamp"] = fmt_time(item["end"])
+        item["reason"] = f"Transcript visual cues: {', '.join(item['cues'])}"
+    return top
+
+
+def write_suggested_ranges(out_dir: Path, source: str, transcript_segments: list[dict], transcript_source: str, cues: list[str], args, duration: float | None = None) -> Path:
+    ranges = suggest_ranges_from_transcript(
+        transcript_segments,
+        cues,
+        float(args.range_padding),
+        int(args.max_ranges),
+        duration,
+    )
+    payload = {
+        "visual_coverage_mode": "suggested_ranges",
+        "source": source,
+        "transcript_source": transcript_source,
+        "transcript_segments": len(transcript_segments),
+        "cue_phrases": cues,
+        "range_padding_seconds": float(args.range_padding),
+        "max_ranges": int(args.max_ranges),
+        "ranges": ranges,
+        "note": "Ranges are transcript-guided suggestions for focused visual extraction; inspect resulting frames before making visual claims.",
+    }
+    path = out_dir / "suggested_ranges.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if transcript_segments:
+        (out_dir / "transcript.txt").write_text("\n".join(f"[{s['timestamp']}] {s['text']}" for s in transcript_segments), encoding="utf-8")
+    return path
+
+
+def load_ranges(path: Path) -> list[dict]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        ranges = data.get("ranges") or data.get("suggested_ranges") or []
+    elif isinstance(data, list):
+        ranges = data
+    else:
+        raise SystemExit(f"Unsupported ranges JSON shape: {path}")
+    parsed = []
+    for idx, item in enumerate(ranges, 1):
+        if not isinstance(item, dict):
+            continue
+        start = parse_time(str(item.get("start", item.get("start_timestamp", ""))))
+        end = parse_time(str(item.get("end", item.get("end_timestamp", ""))))
+        if start is None or end is None or end <= start:
+            eprint(f"[warn] skipping invalid range #{idx}: {item}")
+            continue
+        item = dict(item)
+        item["start"] = start
+        item["end"] = end
+        item.setdefault("index", idx)
+        parsed.append(item)
+    return parsed
+
+
 def _annotate_frame(path: Path, label: str) -> None:
     """Burn a small index/timestamp label into a frame for contact-sheet triage.
 
@@ -559,6 +701,7 @@ def write_report(out_dir: Path, source: str, video: Path, frames: list[dict], tr
         "end": args.end,
         "resolution": args.resolution,
         "max_frames": args.max_frames,
+        "visual_coverage_mode": meta.get("visual_coverage_mode", "single_range_or_scan"),
     }
     manifest = {
         "summary": summary,
@@ -583,6 +726,7 @@ def write_report(out_dir: Path, source: str, video: Path, frames: list[dict], tr
         f"- **STT provider:** {stt_provider or 'not used'}" + (f" ({stt_model})" if stt_model else ""),
         f"- **Resolution:** {args.resolution}px wide",
         f"- **Range:** {args.start or 'start'} → {args.end or 'end'}",
+        f"- **Visual coverage mode:** {meta.get('visual_coverage_mode', 'single_range_or_scan')}",
         "", "## Next Hermes Steps", "",
         "1. Use `vision_analyze` on the contact sheet to choose important frames.",
         "2. Use `vision_analyze` on selected individual frames for detailed visual interpretation.",
@@ -602,35 +746,7 @@ def write_report(out_dir: Path, source: str, video: Path, frames: list[dict], tr
     (out_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Hermes-native video analysis artifact extractor")
-    ap.add_argument("source", help="Video URL or local video path")
-    ap.add_argument("--start", help="Start time SS, MM:SS, or HH:MM:SS")
-    ap.add_argument("--end", help="End time SS, MM:SS, or HH:MM:SS")
-    ap.add_argument("--max-frames", type=int, default=40, help="Maximum frames to extract (default 40, capped 100)")
-    ap.add_argument("--resolution", type=int, default=768, help="Frame width in pixels (default 768)")
-    ap.add_argument("--fps", type=float, help="Override frame extraction FPS (capped at 2)")
-    ap.add_argument("--out-dir", help="Output directory; default temp dir")
-    ap.add_argument("--format", default="bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best", help="yt-dlp format selector")
-    ap.add_argument("--keep-video", action="store_true", help="Keep downloaded video/clip; default always keeps for now because artifacts reference it")
-    ap.add_argument("--no-subs", action="store_true", help="Skip subtitle/caption fetch")
-    ap.add_argument("--stt-provider", choices=["none", "auto", "local", "groq", "openai", "mistral", "command"], default=os.environ.get("HERMES_VIDEO_WATCH_STT_PROVIDER", "auto"), help="Optional speech-to-text fallback provider (default: env HERMES_VIDEO_WATCH_STT_PROVIDER or auto)")
-    ap.add_argument("--prefer-stt", action="store_true", help="Prefer STT over captions when both are available")
-    ap.add_argument("--stt-model", default=os.environ.get("HERMES_VIDEO_WATCH_STT_MODEL"), help="STT model override (provider-specific)")
-    ap.add_argument("--stt-language", help="Optional language hint such as en")
-    ap.add_argument("--stt-command", default=os.environ.get("HERMES_VIDEO_WATCH_STT_COMMAND"), help="Command STT provider; use {audio} as the audio path placeholder")
-    ap.add_argument("--audio-format", choices=["mp3", "wav"], default="mp3", help="Extracted audio format for STT (default: mp3)")
-    args = ap.parse_args()
-
-    require_binary("ffmpeg")
-    require_binary("ffprobe")
-    args.max_frames = max(1, min(args.max_frames, 100))
-    start = parse_time(args.start)
-    end = parse_time(args.end)
-    if start is not None and end is not None and end <= start:
-        raise SystemExit("--end must be greater than --start")
-
-    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else Path(tempfile.mkdtemp(prefix="hermes-video-watch-"))
+def process_single(args, out_dir: Path, start: float | None, end: float | None, visual_coverage_mode: str = "single_range_or_scan") -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     eprint(f"[info] out_dir={out_dir}")
 
@@ -684,19 +800,152 @@ def main() -> int:
         "stt_model": stt_model_used,
         "stt_requested_provider": args.stt_provider,
         "stt_error": stt_error,
+        "visual_coverage_mode": visual_coverage_mode,
     }
     write_report(out_dir, args.source, video, frames, transcript_segments, subtitle_path, contact_sheet, meta, args)
+    return {
+        "out_dir": str(out_dir),
+        "report": str(out_dir / "report.md"),
+        "manifest": str(out_dir / "manifest.json"),
+        "contact_sheet": str(contact_sheet) if contact_sheet else None,
+        "frames_dir": str(out_dir / "frames"),
+        "frames": len(frames),
+        "transcript_segments": len(transcript_segments),
+        "transcript_source": transcript_source,
+        "stt_provider": stt_provider_used,
+        "visual_coverage_mode": visual_coverage_mode,
+        "start": start,
+        "end": end,
+    }
 
-    print(f"report: {out_dir / 'report.md'}")
-    print(f"manifest: {out_dir / 'manifest.json'}")
-    if contact_sheet:
-        print(f"contact_sheet: {contact_sheet}")
-    print(f"frames_dir: {out_dir / 'frames'}")
-    print(f"frames: {len(frames)}")
-    print(f"transcript_segments: {len(transcript_segments)}")
-    print(f"transcript_source: {transcript_source}")
-    if stt_provider_used:
-        print(f"stt_provider: {stt_provider_used}")
+
+def acquire_transcript_for_suggestions(args, out_dir: Path, start: float | None, end: float | None) -> tuple[list[dict], str, Path | None, Path | None, float]:
+    subtitle_path = None if args.no_subs else download_subtitles(args.source, out_dir)
+    caption_segments = parse_vtt(subtitle_path, start, end) if subtitle_path else []
+    transcript_segments = caption_segments
+    transcript_source = "captions" if caption_segments else "none"
+    video = download_video(args.source, out_dir, start, end, args.format)
+    if not is_url(args.source) and (start is not None or end is not None):
+        video = clip_local_if_needed(video, out_dir, start, end)
+    should_try_stt = args.prefer_stt or not caption_segments
+    selected_stt_provider = resolve_stt_provider(args.stt_provider)
+    if should_try_stt and selected_stt_provider:
+        try:
+            audio = extract_audio(video, out_dir, args.audio_format)
+            stt_segments, _, _ = transcribe_audio(audio, selected_stt_provider, args, start or 0)
+            if stt_segments:
+                transcript_segments = stt_segments
+                transcript_source = "stt"
+        except Exception as exc:
+            eprint(f"[warn] STT failed with provider {selected_stt_provider}: {exc}")
+            if caption_segments:
+                transcript_segments = caption_segments
+                transcript_source = "captions"
+    elif should_try_stt and args.stt_provider != "none":
+        eprint("[info] no STT provider configured; continuing without STT")
+    return transcript_segments, transcript_source, subtitle_path, video, ffprobe_duration(video)
+
+
+def run_multi_range(args, out_dir: Path, ranges_path: Path) -> dict:
+    ranges = load_ranges(ranges_path)[: max(1, int(args.max_ranges))]
+    if not ranges:
+        raise SystemExit(f"No valid ranges found in {ranges_path}")
+    results = []
+    ranges_root = out_dir / "ranges"
+    for idx, item in enumerate(ranges, 1):
+        start = float(item["start"])
+        end = float(item["end"])
+        subdir = ranges_root / f"{idx:03d}_{safe_time_for_name(start)}-{safe_time_for_name(end)}"
+        child = argparse.Namespace(**vars(args))
+        child.start = time_arg(start)
+        child.end = time_arg(end)
+        result = process_single(child, subdir, start, end, "multi_range_focused")
+        result["range"] = item
+        results.append(result)
+    manifest = {
+        "visual_coverage_mode": "multi_range_focused",
+        "source": args.source,
+        "ranges_path": str(ranges_path),
+        "out_dir": str(out_dir),
+        "max_frames_per_range": args.max_frames,
+        "range_count": len(results),
+        "results": results,
+        "note": "Multi-range focused extraction covers only the listed ranges; inspect frames/contact sheets before making visual claims.",
+    }
+    path = out_dir / "multi_range_manifest.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Hermes-native video analysis artifact extractor")
+    ap.add_argument("source", help="Video URL or local video path")
+    ap.add_argument("--start", help="Start time SS, MM:SS, or HH:MM:SS")
+    ap.add_argument("--end", help="End time SS, MM:SS, or HH:MM:SS")
+    ap.add_argument("--max-frames", type=int, default=40, help="Maximum frames to extract (default 40, capped 100)")
+    ap.add_argument("--resolution", type=int, default=768, help="Frame width in pixels (default 768)")
+    ap.add_argument("--fps", type=float, help="Override frame extraction FPS (capped at 2)")
+    ap.add_argument("--out-dir", help="Output directory; default temp dir")
+    ap.add_argument("--format", default="bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best", help="yt-dlp format selector")
+    ap.add_argument("--keep-video", action="store_true", help="Keep downloaded video/clip; default always keeps for now because artifacts reference it")
+    ap.add_argument("--no-subs", action="store_true", help="Skip subtitle/caption fetch")
+    ap.add_argument("--stt-provider", choices=["none", "auto", "local", "groq", "openai", "mistral", "command"], default=os.environ.get("HERMES_VIDEO_WATCH_STT_PROVIDER", "auto"), help="Optional speech-to-text fallback provider (default: env HERMES_VIDEO_WATCH_STT_PROVIDER or auto)")
+    ap.add_argument("--prefer-stt", action="store_true", help="Prefer STT over captions when both are available")
+    ap.add_argument("--stt-model", default=os.environ.get("HERMES_VIDEO_WATCH_STT_MODEL"), help="STT model override (provider-specific)")
+    ap.add_argument("--stt-language", help="Optional language hint such as en")
+    ap.add_argument("--stt-command", default=os.environ.get("HERMES_VIDEO_WATCH_STT_COMMAND"), help="Command STT provider; use {audio} as the audio path placeholder")
+    ap.add_argument("--audio-format", choices=["mp3", "wav"], default="mp3", help="Extracted audio format for STT (default: mp3)")
+    ap.add_argument("--suggest-ranges", action="store_true", help="Write suggested_ranges.json from transcript/STT visual cue phrases and exit")
+    ap.add_argument("--ranges", help="JSON ranges file for multi-range focused extraction (for example suggested_ranges.json)")
+    ap.add_argument("--range-padding", type=float, default=20.0, help="Seconds to pad around transcript visual cue hits when suggesting ranges (default 20)")
+    ap.add_argument("--max-ranges", type=int, default=8, help="Maximum suggested/extracted ranges for long-video deep mode (default 8)")
+    ap.add_argument("--visual-cues", help="Comma-separated visual cue phrases for --suggest-ranges")
+    args = ap.parse_args()
+
+    require_binary("ffmpeg")
+    require_binary("ffprobe")
+    args.max_frames = max(1, min(args.max_frames, 100))
+    start = parse_time(args.start)
+    end = parse_time(args.end)
+    if start is not None and end is not None and end <= start:
+        raise SystemExit("--end must be greater than --start")
+
+    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else Path(tempfile.mkdtemp(prefix="hermes-video-watch-"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.suggest_ranges:
+        cues = parse_visual_cues(args.visual_cues)
+        transcript_segments, transcript_source, _subtitle_path, _video, duration = acquire_transcript_for_suggestions(args, out_dir, start, end)
+        path = write_suggested_ranges(out_dir, args.source, transcript_segments, transcript_source, cues, args, duration)
+        print(f"suggested_ranges: {path}")
+        print("visual_coverage_mode: suggested_ranges")
+        print(f"ranges: {len(json.loads(path.read_text(encoding='utf-8')).get('ranges', []))}")
+        print(f"transcript_segments: {len(transcript_segments)}")
+        print(f"transcript_source: {transcript_source}")
+        return 0
+
+    if args.ranges:
+        manifest = run_multi_range(args, out_dir, Path(args.ranges).expanduser().resolve())
+        print(f"multi_range_manifest: {out_dir / 'multi_range_manifest.json'}")
+        print("visual_coverage_mode: multi_range_focused")
+        print(f"ranges: {manifest['range_count']}")
+        for result in manifest["results"]:
+            print(f"range_report: {result['report']}")
+        return 0
+
+    result = process_single(args, out_dir, start, end, "single_range_or_scan")
+    print(f"report: {result['report']}")
+    print(f"manifest: {result['manifest']}")
+    if result.get("contact_sheet"):
+        print(f"contact_sheet: {result['contact_sheet']}")
+    print(f"frames_dir: {result['frames_dir']}")
+    print(f"frames: {result['frames']}")
+    print(f"transcript_segments: {result['transcript_segments']}")
+    print(f"transcript_source: {result['transcript_source']}")
+    print(f"visual_coverage_mode: {result['visual_coverage_mode']}")
+    if result.get("stt_provider"):
+        print(f"stt_provider: {result['stt_provider']}")
     return 0
 
 
